@@ -59,7 +59,7 @@ afterwards about 9 times out of 10.
 ## Tests
 
 ```
-python -m unittest test_preindent -v
+python -m unittest test_efpit -v
 ```
 
 The tests run headless (Tkinter is stubbed).
