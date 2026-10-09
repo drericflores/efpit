@@ -1,5 +1,8 @@
 """
-Ef Reindenter / Python Formatter — Unified Strong Edition
+Easy & Flexible Python Identation Tool
+EFPIT (new app name)
+Ef Reindenter (old app name)
+Efpit / Python Formatter — Unified Strong Edition
 Version 3.2-B — by Dr. Eric O. Flores (Ef-brand)
 
 Features:

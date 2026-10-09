@@ -1,11 +1,11 @@
-# Ef-Reindenter
+# Easy & Flexible Python Indentation Tool (efpit)
 
 Python code re-indenter and formatter with a Tk GUI. Load a script with broken
 indentation, click a button, get properly indented Python back.
 
-Run it with `python preindent.py` (Python 3.8+, Tkinter required; no other dependencies).
+Run it with `python efpit.py` (Python 3.8+, Tkinter required; no other dependencies).
 
-## How the indenter works
+## How does the efpit works
 
 Indentation is recalculated **line by line from the structure of the lines before
 it**, not by adding to whatever indentation each line already had (that was the
@@ -61,13 +61,6 @@ python -m unittest test_preindent -v
 ```
 
 The tests run headless (Tkinter is stubbed).
-
-## Python or another language?
-
-Python is the right language for this tool: it needs the `ast` and `tokenize`
-modules to understand Python code safely, and a GUI toolkit that ships with
-Python. C, C++ or Java would mean re-implementing a Python tokenizer and parser
-for no benefit.
 
 ## License
 
