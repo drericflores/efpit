@@ -24,7 +24,7 @@ cause of the old "indent keeps growing" bug):
 
 None of this needs the code to be valid Python.
 
-###Note:  I used Claude to help fix 4 bugs that the original code had.
+### Note:  I used Claude to help fix 4 bugs that the original code had.
 
 ### Two modes (Edit menu)
 
