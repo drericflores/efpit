@@ -28,8 +28,10 @@ import ast
 import builtins
 import importlib.util
 import io
+import keyword
 import os
 import re
+import string
 import subprocess
 import sys
 import tempfile
@@ -177,6 +179,9 @@ class PythonReindenterApp:
             offvalue=False,
         )
         edit_menu.add_command(label="Apply Indent", command=self.apply_indent_from_menu)
+        edit_menu.add_command(
+            label="Reset && Recalculate Indent", command=self.reset_and_recalculate_indent
+        )
         edit_menu.add_separator()
         edit_menu.add_command(label="Format (PEP 8)", command=self.apply_pep8_format)
         edit_menu.add_command(label="Organize Imports (PEP 8)", command=self.organize_imports)
@@ -393,185 +398,370 @@ class PythonReindenterApp:
         spaces = self.indent_spaces_var.get()
         code = self._normalize_newlines(code)
         code = self._detab(code, spaces)
-        code = self._heuristic_block_repair(code, spaces)
         code = self._reindent_only(code, spaces)
         code = self._strip_trailing_whitespace(code).rstrip() + "\n"
 
         self.display_code(code)
         self.indentation_applied = True
         self.update_save_state()
-        self.set_status("Indentation applied (with heuristic repair)")
+        self.set_status("Indentation applied (structural repair + reindent)")
 
-    def _heuristic_block_repair(self, s: str, spaces: int) -> str:
+    def reset_and_recalculate_indent(self):
         """
-        Best-effort structural repair before reindent:
-
-        • Re-aligns elif/else/except/finally under their controlling
-          if/try/except.
-        • Fixes obviously wrong top-level returns/breaks/etc that
-          should be inside a block.
-        • Indents def under an active class when it looks like a
-          mis-dedented method.
-
-        The goal is to give _reindent_only a more sensible starting
-        structure without being overly aggressive on already-valid code.
+        Discards ALL existing indentation, then rebuilds it line by line from
+        the structure of the preceding lines. Use this when the original
+        indentation of a pasted/broken script cannot be trusted.
         """
-        lines = s.splitlines()
-        if not lines:
-            return s
+        code = self._get_buffer()
+        spaces = self.indent_spaces_var.get()
+        code = self._normalize_newlines(code)
+        code = self._detab(code, spaces)
+        code = self._reindent_only(code, spaces, reset=True)
+        code = self._strip_trailing_whitespace(code).rstrip() + "\n"
+        self.display_code(code)
+        self.indentation_applied = True
+        self.update_save_state()
+        self.set_status("Indentation reset and recalculated from structure")
 
-        # (keyword, indent, line_index)
-        colon_stack: List[Tuple[str, int, int]] = []
-        control_keywords = {
-            "if",
-            "elif",
-            "else",
-            "for",
-            "while",
-            "try",
-            "except",
-            "finally",
-            "with",
-            "def",
-            "class",
-        }
-        repair_keywords = {"return", "break", "continue", "raise", "pass"}
+    # Keywords that continue a compound statement, and which openers they
+    # may legally attach to.
+    _CONTINUATION_KW = {
+        "elif": {"if", "elif"},
+        "else": {"if", "elif", "for", "while", "try", "except"},
+        "except": {"try", "except"},
+        "finally": {"try", "except", "else"},
+    }
 
-        def leading_spaces(line: str) -> int:
-            return len(line) - len(line.lstrip(" "))
+    _BODY_ENDERS = {"return", "raise", "break", "continue", "pass"}
 
-        for idx, line in enumerate(lines):
+    _COMPOUND_KW = {
+        "if", "elif", "else", "for", "while", "try", "except", "finally",
+        "with", "def", "class",
+    }
+
+    @staticmethod
+    def _scan_code_line(line: str, triple: Optional[str], depth: int):
+        """
+        Scan one physical line, tracking string/bracket state.
+
+        Returns (code, triple, depth) where `code` is the line with string
+        contents blanked out and comments removed (so keyword and trailing
+        colon checks cannot be fooled by text inside strings or comments),
+        `triple` is the open triple-quote delimiter (or None) and `depth`
+        is the open-bracket depth after the line.
+        """
+        i, n = 0, len(line)
+        out: List[str] = []
+        while i < n:
+            if triple:
+                j = i
+                while j < n:
+                    if line[j] == "\\":
+                        j += 2
+                        continue
+                    if line.startswith(triple, j):
+                        break
+                    j += 1
+                if j >= n:
+                    return "".join(out), triple, depth
+                i = j + 3
+                triple = None
+                continue
+            c = line[i]
+            if c == "#":
+                break
+            if c in "\"'":
+                if line.startswith(c * 3, i):
+                    triple = c * 3
+                    out.append('""')
+                    i += 3
+                    continue
+                j = i + 1
+                while j < n and line[j] != c:
+                    j += 2 if line[j] == "\\" else 1
+                out.append('""')
+                i = j + 1
+                continue
+            if c in "([{":
+                depth += 1
+            elif c in ")]}":
+                depth = max(0, depth - 1)
+            out.append(c)
+            i += 1
+        return "".join(out), triple, depth
+
+    def _isolated_dedent_fixes(self, lines: List[str]):
+        """
+        Find single statements whose indentation drops below BOTH neighbours
+        without any block opener explaining it, e.g.
+
+                a = 1
+            b = 2        <- stray dedent
+                c = 3
+
+        and return {line_index: indent_to_use} treating them as part of the
+        surrounding block instead of closing it.
+        """
+        stmts: List[Tuple[int, int, bool, bool]] = []   # idx, indent, opens, is_cont_kw
+        triple: Optional[str] = None
+        depth = 0
+        mid = False
+        for i, line in enumerate(lines):
+            st = line.strip()
+            if triple is not None or mid:
+                code, triple, depth = self._scan_code_line(line, triple, depth)
+                if triple is None and depth == 0 and not code.rstrip().endswith("\\"):
+                    mid = False
+                    if stmts:
+                        idx, ind, _o, kwc = stmts[-1]
+                        stmts[-1] = (idx, ind, code.rstrip().endswith(":"), kwc)
+                continue
+            if not st or st.startswith("#"):
+                continue
+            code, triple, depth = self._scan_code_line(line, None, 0)
+            m = re.match(r"\s*([A-Za-z_][A-Za-z0-9_]*)", code)
+            kwc = bool(m and m.group(1) in self._CONTINUATION_KW)
+            stmts.append((i, len(line) - len(line.lstrip(" ")), code.rstrip().endswith(":"), kwc))
+            mid = triple is not None or depth > 0 or code.rstrip().endswith("\\")
+        fixes: Dict[int, int] = {}
+        # opener line -> indent of the statement after it (its first body line)
+        body_hint: Dict[int, int] = {}
+        for k in range(len(stmts) - 1):
+            if stmts[k][2]:
+                body_hint[stmts[k][0]] = stmts[k + 1][1]
+        self._body_hint = body_hint
+        for k in range(1, len(stmts) - 1):
+            (_, ip, op, _), (ik, ik_ind, ok_, kk), (_, iq, _, kq) = stmts[k - 1], stmts[k], stmts[k + 1]
+            if op or kk or kq:
+                continue
+            if ok_:
+                # dedented block opener whose body stays deeper than the
+                # previous line -> the opener was dedented by mistake
+                if ik_ind < ip and iq > ip:
+                    fixes[ik] = ip
+                continue
+            if ik_ind < ip and ik_ind < iq:
+                fixes[ik] = min(ip, iq)
+        return fixes
+
+    def _reindent_only(self, s: str, spaces: int, reset: bool = False) -> str:
+        """
+        Re-indent code to `spaces` per level, without needing valid syntax.
+
+        Works statement by statement:
+          * the original indentation decides each statement's nesting level
+            (stray over-indents stay at the enclosing level);
+          * a line after a block opener (a statement ending in ':') is that
+            block's body, even if it was not indented in the source;
+          * elif/else/except/finally are re-attached to a compatible opener
+            when their indentation is wrong, and a def/class/decorator at
+            the same column as an earlier def/class becomes its sibling;
+          * continuation lines keep their position relative to the first
+            line of their statement; comment-only lines are kept and placed
+            at the level their indentation implies;
+          * lines inside multi-line strings are never touched.
+
+        With reset=True the original leading whitespace of every line is
+        discarded first, so each line's indent is recalculated purely from
+        the lines before it (':' opens a level, return/raise/break/continue/
+        pass close one, else/elif/except/finally re-attach, methods go under
+        their class).
+        """
+        lines = s.strip("\n").split("\n")
+        adj: Dict[int, int] = {}
+        hints: Dict[int, int] = {}
+        if not reset:
+            adj = self._isolated_dedent_fixes(lines)
+            hints = getattr(self, "_body_hint", {})
+        if reset:
+            st_triple: Optional[str] = None
+            st_depth = 0
+            flat: List[str] = []
+            for ln in lines:
+                interior = st_triple is not None
+                _c, st_triple, st_depth = self._scan_code_line(ln, st_triple, st_depth)
+                flat.append(ln if interior else ln.strip())
+            lines = flat
+        out: List[str] = []
+
+        # (orig_indent, level, forced): `forced` marks a body that was not
+        # indented in the source and was inferred from the preceding ':'.
+        # entry = [orig_indent, level, forced, statements_seen]
+        stack: List[list] = [[0, 0, False, 1]]
+        openers: List[Tuple[str, int, int]] = []      # (keyword, level, orig_indent)
+
+        triple: Optional[str] = None
+        depth = 0
+        mid = False                  # inside a multi-line statement
+        prev_opens_block = False
+        prev_level = 0
+        prev_indent = 0
+        prev_kw = ""
+
+        stmt_kw = ""
+        stmt_level = 0
+        stmt_indent = 0
+        stmt_new = 0
+        last_code = ""
+        prev_line_opens_bracket = False
+
+        def finish_statement():
+            nonlocal prev_opens_block, prev_level, prev_indent, prev_kw
+            prev_opens_block = last_code.rstrip().endswith(":")
+            prev_level, prev_indent, prev_kw = stmt_level, stmt_indent, stmt_kw
+            # One-line compounds ("if x: y", "else: z") never open a block
+            # but still count as openers for elif/else/except matching.
+            if prev_opens_block or stmt_kw in self._COMPOUND_KW:
+                openers.append((stmt_kw, stmt_level, stmt_indent))
+
+        for line_no, line in enumerate(lines):
             stripped = line.strip()
+
+            # ---- interior of a multi-line string: leave untouched ----
+            if triple is not None:
+                out.append(line)
+                last_code, triple, depth = self._scan_code_line(line, triple, depth)
+                if triple is None and depth == 0 and not last_code.rstrip().endswith("\\"):
+                    mid = False
+                    finish_statement()
+                continue
+
             if not stripped:
+                out.append("")
                 continue
 
-            indent = leading_spaces(line)
+            indent = len(line) - len(line.lstrip(" "))
+            indent = adj.get(line_no, indent) if not mid else indent
+            if not mid:
+                # A block's body can never be shallower than its opener: if
+                # it is, the opener was over-indented -> snap it back.
+                hint = hints.get(line_no)
+                if hint is not None and indent > hint and not prev_opens_block:
+                    cands = [e[0] for e in stack if e[0] < hint]
+                    indent = max(cands) if cands else 0
 
-            # Pop colon_stack when indentation decreases clearly
-            while colon_stack and indent < colon_stack[-1][1]:
-                colon_stack.pop()
+            # ---- continuation of a multi-line statement ----
+            if mid:
+                rel = indent - stmt_indent
+                if rel <= 0:
+                    rel = 0 if stripped[0] in ")]}" else spaces
+                out.append(" " * (stmt_new + rel) + stripped)
+                if stripped.startswith("#"):
+                    continue
+                last_code, triple, depth = self._scan_code_line(line, None, depth)
+                if triple is None and depth == 0 and not last_code.rstrip().endswith("\\"):
+                    mid = False
+                    finish_statement()
+                continue
 
-            m = re.match(r"([A-Za-z_][A-Za-z0-9_]*)", stripped)
+            # ---- comment-only line outside a statement ----
+            if stripped.startswith("#"):
+                if prev_opens_block:
+                    lvl = prev_level + 1
+                else:
+                    k = len(stack) - 1
+                    while k > 0 and stack[k][0] > indent:
+                        k -= 1
+                    lvl = stack[k][1]
+                out.append(" " * (lvl * spaces) + stripped)
+                continue
+
+            # ---- start of a new statement ----
+            code, triple, depth = self._scan_code_line(line, None, 0)
+            m = re.match(r"\s*(@|[A-Za-z_][A-Za-z0-9_]*)", code)
             token = m.group(1) if m else ""
+            kw = token
+            if token == "async":
+                m2 = re.match(r"\s*async\s+([A-Za-z_][A-Za-z0-9_]*)", code)
+                kw = m2.group(1) if m2 else token
 
-            # ----- 1) Align elif/else/except/finally with proper opener -----
-            if token in {"elif", "else", "except", "finally"}:
-                target_indent: Optional[int] = None
-                for kw, kw_indent, _ in reversed(colon_stack):
-                    if token in {"elif", "else"} and kw in {"if", "elif"}:
-                        target_indent = kw_indent
-                        break
-                    if token in {"except", "finally"} and kw in {"try", "except"}:
-                        target_indent = kw_indent
-                        break
-                if target_indent is not None and indent != target_indent:
-                    # Be conservative: only adjust if current indent is smaller
-                    # or obviously misaligned.
-                    if indent < target_indent or indent % spaces != 0:
-                        lines[idx] = " " * target_indent + stripped
-                        indent = target_indent
+            if prev_opens_block:
+                level = prev_level + 1
+                stack.append([indent, level,
+                              2 if indent < prev_indent else int(indent == prev_indent), 0])
+            else:
+                if kw in ("def", "class", "@"):
+                    while len(stack) > 1 and stack[-1][2] == 2:
+                        stack.pop()
+                popped = None
+                popped_all: List[list] = []
+                while len(stack) > 1 and stack[-1][0] > indent:
+                    popped = stack.pop()
+                    popped_all.append(popped)
+                # Misaligned dedent (between two known indents).
+                if popped is not None and stack[-1][0] < indent:
+                    body_ind = hints.get(line_no)
+                    if popped[3] <= 1:
+                        # the block's lone first line was the odd one out:
+                        # this line shows the block's real indent
+                        stack.append([indent, popped[1], popped[2], 1])
+                    elif body_ind is not None:
+                        # A block opener: its body must be deeper than it, so
+                        # it belongs to the deepest known block shallower than
+                        # its own first body line.
+                        known = stack + popped_all[::-1]
+                        fits = [e for e in known if e[0] < body_ind]
+                        if fits:
+                            keep_ind = max(e[0] for e in fits)
+                            stack[:] = [e for e in known if e[0] <= keep_ind]
+                    elif popped[0] - indent < indent - stack[-1][0]:
+                        stack.append(popped)     # clearly closer to the deeper block
 
-            # ----- 2) Fix top-level returns/breaks/etc that belong in a block -----
-            if token in repair_keywords and indent == 0 and colon_stack:
-                # Find nearest block-like opener
-                for kw, kw_indent, _ in reversed(colon_stack):
-                    if kw in {"def", "for", "while", "if", "try", "with", "class"}:
-                        target_indent = kw_indent + spaces
-                        if target_indent > 0:
-                            lines[idx] = " " * target_indent + stripped
-                            indent = target_indent
-                        break
+                # Accepted stray over-indent: remember its column as an alias of
+                # the enclosing level so later lines at that column stay there.
+                if stack[-1][0] < indent:
+                    stack.append([indent, stack[-1][1], False, 0])
 
-            # ----- 3) Methods inside a class: def at same level as class -----
-            if token == "def" and colon_stack:
-                # Look up nearest class
-                for kw, kw_indent, _ in reversed(colon_stack):
-                    if kw == "class":
-                        class_indent = kw_indent
-                        if indent <= class_indent:
-                            target_indent = class_indent + spaces
-                            lines[idx] = " " * target_indent + stripped
-                            indent = target_indent
-                        break
+                # A flat body that already ended in return/raise/break/
+                # continue/pass is closed by the next statement.
+                if (
+                    len(stack) > 1
+                    and stack[-1][2]
+                    and stack[-1][0] == indent
+                    and prev_kw in self._BODY_ENDERS
+                    and prev_level == stack[-1][1]
+                    and token not in self._CONTINUATION_KW
+                ):
+                    stack.pop()
+                level = stack[-1][1]
 
-            # ----- Track colon-based blocks for later lines -----
-            if stripped.endswith(":") and token in control_keywords:
-                colon_stack.append((token, indent, idx))
+                # def/class/decorator at the same column as an earlier
+                # def/class -> sibling of that def, or a member of that class
+                # (repairs flattened methods)
+                if kw in ("def", "class", "@"):
+                    for okw, olv, oind in reversed(openers):
+                        if okw in ("def", "class") and oind == indent:
+                            level = olv + 1 if (okw == "class" and level > olv) else olv
+                            break
 
-        return "\n".join(lines)
+                # elif/else/except/finally -> attach to a compatible opener
+                if token in self._CONTINUATION_KW:
+                    compat = self._CONTINUATION_KW[token]
+                    at_level = [o for o in openers if o[1] == level]
+                    if not (at_level and at_level[-1][0] in compat):
+                        for okw, olv, _ in reversed(openers):
+                            if okw in compat:
+                                level = olv
+                                break
 
-    def _reindent_only(self, s: str, spaces: int) -> str:
-        """
-        Re-indents code based on original indentation structure.
-        Uses a stack to track the original file's indent/dedent levels.
-        """
-        code = s.strip("\n")
-        lines = code.splitlines()
-        indented_lines: List[str] = []
+                while len(stack) > 1 and stack[-1][1] > level:
+                    stack.pop()
 
-        level = 0               # Current logical indent level (0, 1, 2...)
-        indent_stack = [0]      # Stack of original character counts (e.g., [0, 4, 8])
-        paren_balance = 0
-        in_triple = False
-        prev_backslash = False
+            stack[-1][3] += 1
+            while openers and openers[-1][1] >= level:
+                openers.pop()
 
-        for line in lines:
-            original = line
-            stripped = line.strip()
-            logic = re.sub(r"#.*$", "", stripped).strip()
+            new_indent = level * spaces
+            out.append(" " * new_indent + stripped)
 
-            if not logic:
-                indented_lines.append("")
-                prev_backslash = False
-                continue
+            stmt_kw, stmt_level, stmt_indent, stmt_new = kw, level, indent, new_indent
+            last_code = code
+            if triple is not None or depth > 0 or code.rstrip().endswith("\\"):
+                mid = True
+            else:
+                finish_statement()
 
-            # Multi-line string handling
-            if '"""' in logic or "'''" in logic:
-                if logic.count('"""') % 2 == 1 or logic.count("'''") % 2 == 1:
-                    in_triple = not in_triple
-
-            if in_triple:
-                indented_lines.append(" " * (level * spaces) + original.lstrip())
-                prev_backslash = False
-                continue
-
-            # Paren balance
-            paren_balance += logic.count("(") + logic.count("[") + logic.count("{")
-            paren_balance -= logic.count(")") + logic.count("]") + logic.count("}")
-
-            # Indent/Dedent logic based on original spacing
-            if paren_balance == 0 and not prev_backslash:
-                original_indent_len = len(original) - len(original.lstrip(" "))
-
-                if original_indent_len > indent_stack[-1]:
-                    indent_stack.append(original_indent_len)
-                    level += 1
-                elif original_indent_len < indent_stack[-1]:
-                    while original_indent_len < indent_stack[-1] and len(indent_stack) > 1:
-                        indent_stack.pop()
-                        level = max(0, level - 1)
-                    # If it still doesn't match, reset stack heuristically
-                    if original_indent_len != indent_stack[-1]:
-                        steps = max(0, original_indent_len // spaces)
-                        indent_stack = [i * spaces for i in range(steps + 1)]
-                        level = steps
-
-            eff = level
-            if re.match(r"^(elif|else|except|finally)\b", logic):
-                eff = max(0, eff - 1)
-
-            visual = eff * spaces
-
-            if paren_balance > 0 or prev_backslash:
-                visual = (eff + 1) * spaces
-                if re.match(r"^[)\]}]", logic) and paren_balance == 0:
-                    visual = eff * spaces
-
-            indented_lines.append(" " * visual + original.lstrip())
-
-            prev_backslash = stripped.endswith("\\")
-
-        return "\n".join(indented_lines)
+        return "\n".join(out)
 
     # --------------- PEP 8 formatting pipeline ---------------
     def apply_pep8_format(self):
@@ -584,10 +774,7 @@ class PythonReindenterApp:
         code = self._normalize_newlines(code)
         code = self._detab(code, spaces)
         code = self._strip_trailing_whitespace(code)
-        code = self._fix_whitespace_pet_peeves_tokenized(code)
-        code = self._fix_operator_spacing_tokenized(code)
-        code = self._fix_keyword_equals_tokenized(code)
-        code = self._normalize_comments(code)
+        code = self._fix_spacing_tokenized(code)
         code = self._enforce_blank_lines(code)
         code = self._reindent_only(code, spaces)
         if self.wrap_lines_var.get():
@@ -597,6 +784,21 @@ class PythonReindenterApp:
                 comment_width=self.settings.comment_width,
             )
         code = self._strip_trailing_whitespace(code).rstrip() + "\n"
+
+        # Safety net: formatting must never change what the program means.
+        original = self._get_buffer()
+        try:
+            same = ast.dump(ast.parse(original)) == ast.dump(ast.parse(code))
+        except SyntaxError:
+            same = False
+        if not same:
+            messagebox.showwarning(
+                "Formatting skipped",
+                "The formatted result did not match the original program "
+                "structure, so nothing was changed.",
+            )
+            return
+
         self.display_code(code)
         self.indentation_applied = True
         self.update_save_state()
@@ -619,80 +821,87 @@ class PythonReindenterApp:
             self.set_status("No top-level import changes detected")
 
     def _reorder_top_level_imports(self, code: str) -> str:
+        """
+        Group and sort the leading block of top-level imports.
+
+        Works on whole statements (so multi-line ``from x import (...)``
+        stays intact), keeps comments that sit directly above an import with
+        it, and only touches the contiguous run of imports after the module
+        docstring and any ``from __future__`` imports.
+        """
         try:
             tree = ast.parse(code)
         except SyntaxError:
             return code
-        src_lines = code.splitlines()
-        docstring_span = self._module_docstring_span(tree)
-        fut_spans = self._future_import_spans(tree)
-        imports: List[Tuple[int, int, ImportLine]] = []
-        for node in tree.body:
-            if isinstance(node, (ast.Import, ast.ImportFrom)):
-                if isinstance(node, ast.ImportFrom) and node.module == "__future__":
-                    continue
-                start, end = self._node_line_span(node)
-                text = "\n".join(src_lines[start - 1: end])
-                for one in text.splitlines():
-                    if not one.strip() or one.strip().startswith("#"):
-                        continue
-                    norm = one.rstrip()
-                    root_name = self._top_import_root(norm)
-                    group = _classify_top_name(root_name) if root_name else "local"
-                    key = self._import_sort_key(norm)
-                    imports.append((start, end, ImportLine(group, norm, key)))
-        if not imports:
-            return code
-        stdlib = sorted([im for _, _, im in imports if im.group == 'stdlib'], key=lambda i: i.key)
-        thirdp = sorted([im for _, _, im in imports if im.group == 'thirdparty'], key=lambda i: i.key)
-        local = sorted([im for _, _, im in imports if im.group == 'local'], key=lambda i: i.key)
-        new_block_lines: List[str] = []
-        if stdlib:
-            new_block_lines.extend([im.text for im in stdlib])
-        if thirdp:
-            if new_block_lines:
-                new_block_lines.append("")
-            new_block_lines.extend([im.text for im in thirdp])
-        if local:
-            if new_block_lines:
-                new_block_lines.append("")
-            new_block_lines.extend([im.text for im in local])
-        new_block = "\n".join(new_block_lines)
-        block_start = None
-        block_end = None
-        for start, end, _ in imports:
-            block_start = start if block_start is None else min(block_start, start)
-            block_end = end if block_end is None else max(block_end, end)
-        after_line = 0
-        if docstring_span:
-            after_line = max(after_line, docstring_span[1])
-        for sp in fut_spans:
-            after_line = max(after_line, sp[1])
-
-        if block_start is None:
-            return code
-
-        block_start = max(block_start, after_line + 1)
-        i = block_start - 1
-        while i < len(src_lines) and (
-            src_lines[i].strip().startswith(("import ", "from "))
-            or not src_lines[i].strip()
-            or src_lines[i].lstrip().startswith("#")
+        lines = code.split("\n")
+        body = tree.body
+        i = 0
+        if body and self._module_docstring_span(tree):
+            i = 1
+        while (
+            i < len(body)
+            and isinstance(body[i], ast.ImportFrom)
+            and body[i].module == "__future__"
         ):
             i += 1
-        block_end = i
-        header = src_lines[:after_line]
-        tail = src_lines[block_end:]
-        rebuilt: List[str] = []
-        rebuilt.extend(header)
-        if rebuilt and rebuilt[-1].strip():
-            rebuilt.append("")
-        if new_block:
-            rebuilt.extend(new_block.splitlines())
+        region = []
+        while i < len(body) and isinstance(body[i], (ast.Import, ast.ImportFrom)):
+            region.append(body[i])
+            i += 1
+        if not region:
+            return code
+        starts = [n.lineno for n in region]
+        if len(set(starts)) != len(starts) or any(
+            n.end_lineno != n.lineno and False for n in region
+        ):
+            return code  # "import a; import b" on one line: leave alone
+
+        floor = (body[i - len(region) - 1].end_lineno if i - len(region) > 0 else 0)
+        units = []
+        for node in region:
+            first = node.lineno
+            while first - 2 >= floor and lines[first - 2].lstrip().startswith("#") \
+                    and first - 1 > floor:
+                first -= 1
+            floor = node.end_lineno
+            text = lines[first - 1: node.end_lineno]
+            if isinstance(node, ast.Import):
+                root = node.names[0].name
+                kind, mod = 0, node.names[0].name.lower()
+                group = _classify_top_name(root)
+            else:
+                mod = ("." * node.level) + (node.module or "")
+                kind = 1
+                group = "local" if node.level else _classify_top_name(node.module or "")
+                mod = mod.lower()
+            units.append((group, kind, mod, "\n".join(text), first, node.end_lineno))
+
+        start_line = units[0][4]
+        end_line = units[-1][5]
+        seen = set()
+        blocks: Dict[str, List[Tuple[int, str, str]]] = {"stdlib": [], "thirdparty": [], "local": []}
+        for group, kind, mod, text, _a, _b in units:
+            sig = re.sub(r"\s+", " ", text)
+            if sig in seen:
+                continue
+            seen.add(sig)
+            blocks[group].append((kind, mod, text))
+        new_block: List[str] = []
+        for g in ("stdlib", "thirdparty", "local"):
+            if not blocks[g]:
+                continue
+            if new_block:
+                new_block.append("")
+            for _k, _m, text in sorted(blocks[g], key=lambda b: (b[0], b[1], b[2])):
+                new_block.extend(text.split("\n"))
+
+        head = lines[: start_line - 1]
+        tail = lines[end_line:]
+        if head and head[-1].strip():
+            head.append("")
         if tail and tail[0].strip():
-            rebuilt.append("")
-        rebuilt.extend(tail)
-        return "\n".join(line.rstrip() for line in rebuilt)
+            tail.insert(0, "")
+        return "\n".join(head + new_block + tail)
 
     def _module_docstring_span(self, tree: ast.Module) -> Optional[Tuple[int, int]]:
         if not tree.body:
@@ -703,32 +912,8 @@ class PythonReindenterApp:
             and isinstance(getattr(node0, "value", None), ast.Constant)
             and isinstance(node0.value.value, str)
         ):
-            return self._node_line_span(node0)
+            return (node0.lineno, getattr(node0, "end_lineno", node0.lineno))
         return None
-
-    def _future_import_spans(self, tree: ast.Module) -> List[Tuple[int, int]]:
-        spans: List[Tuple[int, int]] = []
-        for node in tree.body:
-            if isinstance(node, ast.ImportFrom) and node.module == "__future__":
-                spans.append(self._node_line_span(node))
-        return spans
-
-    def _node_line_span(self, node: ast.AST) -> Tuple[int, int]:
-        start = getattr(node, "lineno", 1)
-        end = getattr(node, "end_lineno", start)
-        return (start, end)
-
-    def _top_import_root(self, line: str) -> str:
-        m = re.match(r"\s*import\s+([A-Za-z_][A-Za-z0-9_\.]*)(\s+as\s+\w+)?", line)
-        if m:
-            return m.group(1).split(".")[0]
-        m = re.match(r"\s*from\s+([\.A-Za-z_][A-Za-z0-9_\.]*)\s+import\s+", line)
-        if m:
-            return m.group(1)
-        return ""
-
-    def _import_sort_key(self, line: str) -> str:
-        return re.sub(r"\s+", " ", line.strip()).lower()
 
     # --------------- Tokenize-aware whitespace fixes ---------------
     @staticmethod
@@ -737,197 +922,349 @@ class PythonReindenterApp:
 
     @staticmethod
     def _detab(s: str, spaces: int) -> str:
-        return s.expandtabs(spaces)
-
-    @staticmethod
-    def _strip_trailing_whitespace(s: str) -> str:
-        return "\n".join(line.rstrip() for line in s.splitlines())
-
-    def _fix_whitespace_pet_peeves_tokenized(self, s: str) -> str:
-        out_lines: List[str] = []
-        for line in s.splitlines():
-            line = re.sub(r"([A-Za-z0-9_\]\)])\s+\(", r"\1(", line)   # func (x) -> func(x)
-            line = re.sub(r"\s+\[", "[", line)                        # a [i] -> a[i]
-            line = re.sub(r"\s+,", ",", line)                         # no space before comma
-            line = re.sub(r",\s*", ", ", line)
-            line = re.sub(r",\s+([)\]}])", r",\1", line)
-            line = re.sub(r"\s+:\s*", ": ", line)                     # dict/kwargs colon
-            prefix = re.match(r"\s*", line).group(0)
-            rest = line[len(prefix):]
-            rest = re.sub(r"\s{2,}", " ", rest)
-            out_lines.append(prefix + rest)
-        return "\n".join(out_lines)
-
-    def _fix_operator_spacing_tokenized(self, s: str) -> str:
-        ops = {
-            "+=", "-=", "*=", "/=", "%=", "**=", "//=", "==", "!=", "<=",
-            ">=", "<<=", ">>=", "<<", ">>", "+", "-", "*", "//", "/", "%", "**",
-            "=", "<", ">",
-        }
-        keywords = {"and", "or", "in", "is"}
-
-        def fix_line(line: str) -> str:
-            if not line.strip() or line.lstrip().startswith("#"):
-                return line.rstrip()
-            if "#" in line:
-                code_part, comment = line.split("#", 1)
-            else:
-                code_part, comment = line, None
-
-            # Don't add spaces around = in kwargs
-            if "(" in code_part or "def " in code_part:
-                code_part = re.sub(
-                    r"(\b[A-Za-z_][A-Za-z0-9_]*)\s*=\s*",
-                    r"\1=",
-                    code_part,
-                )
-
-            buff = io.StringIO(code_part)
-            new_parts: List[str] = []
-            prev_end = (1, 0)
-            try:
-                for tok in tokenize.generate_tokens(buff.readline):
-                    ttype, tstr, start, end, _ = tok
-                    gap_start = self._pos_to_idx(code_part, prev_end)
-                    gap_end = self._pos_to_idx(code_part, start)
-                    gap = code_part[gap_start:gap_end]
-
-                    new_parts.append(gap)
-
-                    if ttype == tokenize.OP and tstr in ops:
-                        # Don't add space for '=' if it's a kwarg (handled above)
-                        if tstr == "=" and gap_start > 0 and code_part[gap_start - 1].isalnum():
-                            new_parts.append(tstr)
-                        else:
-                            new_parts.append(f" {tstr} ")
-                    elif ttype == tokenize.NAME and tstr in keywords:
-                        new_parts.append(f" {tstr} ")
-                    else:
-                        new_parts.append(tstr)
-                    prev_end = end
-            except tokenize.TokenError:
-                # Fallback if tokenizing fails (e.g., incomplete line)
-                code_part = re.sub(
-                    r"\s*([+\-*/%]=|\*\*=?|//=|==|!=|<=|>=|<<=?|>>=?|[+\-*/%]|/|=|<|>)\s*",
-                    lambda m: f" {m.group(1)} ",
-                    code_part,
-                )
-                code_part = re.sub(r"\s{2,}", " ", code_part)
-                result = code_part
-            else:
-                result = "".join(new_parts)
-                result = re.sub(r"\s{2,}", " ", result)
-
-            if comment is not None:
-                result = result.rstrip() + "  # " + comment.strip()
-            return result.rstrip()
-
-        return "\n".join(fix_line(l) for l in s.splitlines())
-
-    def _fix_keyword_equals_tokenized(self, s: str) -> str:
-        def fix_line(line: str) -> str:
-            if not line.strip() or line.lstrip().startswith("#"):
-                return line
-            if "#" in line:
-                code, comment = line.split("#", 1)
-                comment = "  # " + comment.strip()
-            else:
-                code, comment = line, ""
-            if "def " in code or "(" in code:
-                code = re.sub(r":\s*=", ":=", code)  # protect walrus
-                code = re.sub(
-                    r"(\b[A-Za-z_][A-Za-z0-9_]*)\s*=\s*",
-                    r"\1=",
-                    code,
-                )
-                code = code.replace(":=", ":= ")  # Add space back for walrus
-            result = code.rstrip() + comment
-            return result.rstrip()
-
-        return "\n".join(fix_line(l) for l in s.splitlines())
-
-    @staticmethod
-    def _normalize_comments(s: str) -> str:
-        lines = s.splitlines()
+        """Expand tabs in leading indentation only; string contents are kept."""
         out: List[str] = []
-        for line in lines:
-            stripped = line.lstrip()
-            indent = line[: len(line) - len(stripped)]
-            if stripped.startswith("#") and not stripped.startswith("#!"):
-                if stripped.startswith("# -*-") or stripped.startswith("# coding"):
-                    out.append(line.rstrip())
-                    continue
-                content = stripped[1:]
-                if content and not content.startswith(" "):
-                    content = " " + content
-                wrapped = textwrap.fill(
-                    content.lstrip(),
-                    width=72,
-                    initial_indent="",
-                    subsequent_indent="",
-                    break_long_words=False,
-                    break_on_hyphens=False,
-                )
-                for w in wrapped.split("\n"):
-                    out.append((indent + "#" + (" " if w else "") + w).rstrip())
-            else:
-                if "#" in line and not stripped.startswith("#"):
-                    code, comment = line.split("#", 1)
-                    code = code.rstrip()
-                    comment = "  # " + comment.strip()
-                    out.append((code + comment).rstrip())
-                else:
-                    out.append(line.rstrip())
+        triple: Optional[str] = None
+        depth = 0
+        for line in s.split("\n"):
+            interior = triple is not None
+            _c, triple, depth = PythonReindenterApp._scan_code_line(line, triple, depth)
+            if interior or "\t" not in line:
+                out.append(line)
+                continue
+            body = line.lstrip(" \t")
+            lead = line[: len(line) - len(body)]
+            out.append(lead.expandtabs(spaces) + body)
         return "\n".join(out)
 
     @staticmethod
-    def _enforce_blank_lines(s: str) -> str:
-        lines = s.splitlines()
+    def _strip_trailing_whitespace(s: str) -> str:
+        """rstrip each line unless it ends inside a multi-line string."""
         out: List[str] = []
+        triple: Optional[str] = None
+        depth = 0
+        for line in s.split("\n"):
+            _c, triple, depth = PythonReindenterApp._scan_code_line(line, triple, depth)
+            out.append(line if triple is not None else line.rstrip())
+        return "\n".join(out)
+
+    def _fix_spacing_tokenized(self, s: str) -> str:
+        """
+        PEP 8 whitespace normalisation (E2xx) driven by the tokenizer.
+
+        Only the gaps *between* tokens on one line are edited, and inline
+        comments get two spaces plus a "# " prefix. String literals,
+        f-strings and comment bodies are never modified.
+        """
+        try:
+            toks = list(tokenize.generate_tokens(io.StringIO(s).readline))
+        except (tokenize.TokenError, SyntaxError):
+            return s
+
+        T = tokenize
+        fs_start = getattr(T, "FSTRING_START", None)
+        fs_end = getattr(T, "FSTRING_END", None)
+        skip_types = {T.NEWLINE, T.NL, T.INDENT, T.DEDENT, T.ENDMARKER}
+
+        raw = s.split("\n")
+        offsets = [0]
+        for ln in raw:
+            offsets.append(offsets[-1] + len(ln) + 1)
+
+        def idx(pos):
+            return offsets[pos[0] - 1] + pos[1]
+
+        COMPARE = {"==", "!=", "<", ">", "<=", ">=", "->", ":=", "<>",
+                   "+=", "-=", "*=", "/=", "//=", "%=", "**=", "@=", "&=",
+                   "|=", "^=", ">>=", "<<="}
+        ARITH = {"+", "-", "*", "/", "//", "%", "**", "@", "&", "|", "^", "<<", ">>"}
+        OPEN, CLOSE = "([{", ")]}"
+
+        def is_kw(t):
+            return t.type == T.NAME and keyword.iskeyword(t.string) and \
+                t.string not in ("True", "False", "None")
+
+        def operand_end(t):
+            if t is None:
+                return False
+            if t.type == T.NAME:
+                return not is_kw(t)
+            if t.type in (T.NUMBER, T.STRING) or t.type == fs_end:
+                return True
+            return t.type == T.OP and t.string in CLOSE + "..."
+
+        frames = [{"ch": None, "annot": False, "lam": False}]
+        edits: List[Tuple[int, int, str]] = []
+        prev = None
+        prev_cls = None
+        prev_colon_slice = False
+        fdepth = 0
+
+        for tok in toks:
+            tt, ts = tok.type, tok.string
+
+            if tt in skip_types:
+                if tt in (T.NEWLINE, T.NL):
+                    prev = None
+                    prev_cls = None
+                if tt == T.NEWLINE:
+                    frames[0]["annot"] = False
+                    frames[0]["lam"] = False
+                continue
+
+            if tt == T.COMMENT:
+                if prev is not None and prev.end[0] == tok.start[0] and fdepth == 0:
+                    a, b = idx(prev.end), idx(tok.start)
+                    if s[a:b].strip(" \t") == "" and s[a:b] != "  ":
+                        edits.append((a, b, "  "))
+                body = ts[1:]
+                if (body and body[0] not in " !:#\t"
+                        and not (tok.start[0] == 1 and body[0] == "!")):
+                    edits.append((idx(tok.start) + 1, idx(tok.start) + 1, " "))
+                continue
+
+            # ---- f-string interiors are opaque ----
+            if fs_start is not None and tt == fs_start and fdepth == 0:
+                pass  # gap before the f-string is ordinary code
+            elif fdepth > 0 or tt == fs_end:
+                if tt == fs_start:
+                    fdepth += 1
+                elif tt == fs_end:
+                    fdepth -= 1
+                    if fdepth == 0:
+                        prev, prev_cls = tok, "operand"
+                continue
+            if fs_start is not None and tt == fs_start:
+                fdepth += 1
+                gap_prev = prev
+            else:
+                gap_prev = prev
+
+            top = frames[-1]
+            cls = "other"
+            if tt == T.OP:
+                if ts in OPEN:
+                    cls = "open"
+                elif ts in CLOSE:
+                    cls = "close"
+                elif ts == ",":
+                    cls = "comma"
+                elif ts == ";":
+                    cls = "semi"
+                elif ts == ":":
+                    cls = "colon"
+                elif ts == "=":
+                    cls = "tight" if ((top["ch"] == "(" and not top["annot"]) or top["lam"]) else "sp"
+                elif ts in COMPARE:
+                    cls = "sp"
+                elif ts in ARITH:
+                    cls = "sp" if operand_end(prev) else "unary"
+                elif ts == "~":
+                    cls = "unary"
+                elif ts == ".":
+                    cls = "dot"
+            if tt == T.NAME and ts == "lambda":
+                top["lam"] = True
+
+            # ---- decide gap between prev and tok ----
+            if prev is not None and prev.end[0] == tok.start[0]:
+                a, b = idx(prev.end), idx(tok.start)
+                orig = s[a:b]
+                new: Optional[str] = None
+                if orig.strip(" \t") == "":
+                    if cls == "tight" or prev_cls == "tight":
+                        new = ""
+                    elif cls == "sp" or prev_cls == "sp":
+                        new = " "
+                    elif prev_cls == "unary":
+                        new = ""
+                    elif cls == "close" or prev_cls == "open":
+                        new = ""
+                    elif cls in ("comma", "semi"):
+                        new = ""
+                    elif prev_cls in ("comma", "semi"):
+                        new = " "
+                    elif cls == "colon":
+                        new = None if top["ch"] == "[" else ""
+                    elif prev_cls == "colon":
+                        new = None if prev_colon_slice else " "
+                    elif is_kw(prev):
+                        new = None if (cls == "dot") else " "
+                    elif cls == "open" and ts in "([" and (
+                        (prev.type == T.NAME and prev.string not in ("match", "case"))
+                        or (prev.type == T.OP and prev.string in ")]")
+                    ):
+                        new = ""
+                    elif cls == "dot":
+                        if operand_end(prev) and prev.type != T.NUMBER:
+                            new = ""
+                        elif prev_cls == "dot":
+                            new = ""
+                    elif prev_cls == "dot":
+                        new = " " if is_kw(tok) else ""
+                    elif orig != "":
+                        new = " "
+                    if new is not None and new != orig:
+                        edits.append((a, b, new))
+
+            # ---- update context after this token ----
+            if cls == "open":
+                frames.append({"ch": ts, "annot": False, "lam": False})
+            elif cls == "close":
+                if len(frames) > 1:
+                    frames.pop()
+            elif cls == "comma":
+                top["annot"] = False
+            elif cls == "colon":
+                prev_colon_slice = top["ch"] == "["
+                if top["lam"]:
+                    top["lam"] = False
+                else:
+                    top["annot"] = True
+
+            prev, prev_cls = tok, cls
+
+        for a, b, new in sorted(edits, key=lambda e: e[0], reverse=True):
+            s = s[:a] + new + s[b:]
+        return s
+
+    @staticmethod
+    def _enforce_blank_lines(s: str) -> str:
+        """
+        PEP 8 blank-line rules (E301/E302/E303/E305), computed from the
+        lexical structure so string contents are never touched:
+          * two blank lines around top-level def/class (and their decorators
+            or comments sitting directly above them);
+          * one blank line before nested def/class unless first in its block;
+          * no more than 2 blank lines at top level, 1 inside blocks.
+        """
+        scan = PythonReindenterApp._scan_code_line
+        lines = s.split("\n")
+        # ---- classify physical lines ----
+        # kind: 'raw' (string interior / continuation / blank inside brackets),
+        #       'blank', 'comment', 'stmt'
+        info: List[Tuple[str, int, str]] = []   # (kind, indent, first token)
+        triple: Optional[str] = None
+        depth = 0
+        mid = False
+        stmt_end_opens: Dict[int, bool] = {}
+        cur_stmt = -1
+        for i, line in enumerate(lines):
+            st = line.strip()
+            if triple is not None:
+                info.append(("raw", 0, ""))
+                code, triple, depth = scan(line, triple, depth)
+            elif mid:
+                info.append(("raw", 0, ""))
+                code, triple, depth = scan(line, None, depth)
+            elif not st:
+                info.append(("blank", 0, ""))
+                continue
+            elif st.startswith("#"):
+                info.append(("comment", len(line) - len(line.lstrip(" ")), ""))
+                continue
+            else:
+                code, triple, depth = scan(line, None, 0)
+                m = re.match(r"\s*(@|[A-Za-z_][A-Za-z0-9_]*)", code)
+                tok = m.group(1) if m else ""
+                if tok == "async":
+                    tok = "def"
+                info.append(("stmt", len(line) - len(line.lstrip(" ")), tok))
+                cur_stmt = i
+            mid = triple is not None or depth > 0 or code.rstrip().endswith("\\")
+            if not mid:
+                stmt_end_opens[cur_stmt] = code.rstrip().endswith(":")
+
+        out: List[str] = []
+        pending = 0                     # blank lines waiting to be placed
+        prev_item: Optional[Tuple[str, int, str, bool]] = None   # kind, indent, token, opens
+        last_top_def = False
+        group_open = False              # inside a comment/decorator run above a def
         i = 0
+        n = len(lines)
 
-        def is_toplevel_def_or_class(idx: int) -> bool:
-            if idx >= len(lines):
-                return False
-            line = lines[idx]
-            if line.lstrip().startswith("@"):
-                j = idx + 1
-                while j < len(lines) and not lines[j].strip():
+        def is_def(tok):
+            return tok in ("def", "class", "@")
+
+        while i < n:
+            kind, indent, tok = info[i]
+            if kind == "raw":
+                out.append(lines[i])
+                i += 1
+                continue
+            if kind == "blank":
+                pending += 1
+                i += 1
+                continue
+
+            # ---- an item: comment line or statement start ----
+            head_def = False
+            if kind == "stmt" and is_def(tok):
+                head_def = True
+            elif kind == "comment":
+                j = i + 1
+                while j < n and info[j][0] == "comment":
                     j += 1
-                if j < len(lines):
-                    return lines[j].startswith("def ") or lines[j].startswith("class ")
-                return False
-            return line.startswith("def ") or line.startswith("class ")
+                if j < n and info[j][0] == "stmt" and is_def(info[j][2]) \
+                        and info[j][1] == indent:
+                    head_def = True
 
-        def is_method_def(line: str) -> bool:
-            return re.match(r"\s+def\s+\w", line) is not None
+            if prev_item is None:
+                want = 0
+            elif group_open and (kind == "stmt" or kind == "comment"):
+                # continuation of a comment/decorator run directly above a def
+                want = min(pending, 1) if kind == "comment" and pending else 0
+            else:
+                limit = 2 if indent == 0 else 1
+                want = min(pending, limit)
+                p_kind, p_indent, p_tok, p_opens = prev_item
+                if head_def:
+                    if p_opens:
+                        want = 0
+                    else:
+                        want = 2 if indent == 0 else 1
+                elif (indent == 0 and last_top_def
+                      and not (p_kind == "comment" and pending == 0)
+                      and kind in ("stmt", "comment")):
+                    want = 2
+                if p_opens and not head_def:
+                    want = 0 if pending == 0 else min(pending, 1)
+                    if kind == "comment" or indent > 0:
+                        want = min(pending, 1) if pending else 0
 
-        while i < len(lines):
-            line = lines[i]
-            if is_toplevel_def_or_class(i):
-                while out and out[-1].strip() == "":
-                    out.pop()
-                if out:
-                    out.append("")
-                    out.append("")
-                while i < len(lines) and lines[i].lstrip().startswith("@"):
-                    out.append(lines[i].rstrip())
-                    i += 1
-                if i < len(lines):
-                    out.append(lines[i].rstrip())
-                    i += 1
-                    continue
-            if is_method_def(line) and out and out[-1].strip():
-                out.append("")
-            out.append(line.rstrip())
+            out.extend([""] * want)
+            pending = 0
+
+            if kind == "comment":
+                out.append(lines[i])
+                group_open = head_def or (group_open and True)
+                prev_item = ("comment", indent, "", False) if prev_item is None or True else prev_item
+                i += 1
+                continue
+
+            # statement: emit first line (continuations follow as 'raw')
+            out.append(lines[i])
+            opens = stmt_end_opens.get(i, False)
+            if indent == 0:
+                last_top_def = is_def(tok)
+            group_open = tok == "@"
+            prev_item = ("stmt", indent, tok, opens)
             i += 1
+
         while out and out[-1].strip() == "":
             out.pop()
         return "\n".join(out)
 
     def _wrap_long_lines_tokenized(self, s: str, width: int = 79, comment_width: int = 72) -> str:
         out: List[str] = []
-        for line in s.splitlines():
+        triple: Optional[str] = None
+        depth = 0
+        for line in s.split("\n"):
+            started_in_string = triple is not None
+            _c, triple, depth = self._scan_code_line(line, triple, depth)
+            if started_in_string or triple is not None:
+                out.append(line)          # never re-wrap text inside a string
+                continue
             if len(line) <= width:
                 out.append(line)
                 continue
@@ -952,361 +1289,373 @@ class PythonReindenterApp:
                 continue
             breaks: List[int] = []
             level = 0
+            fs_start = getattr(tokenize, "FSTRING_START", None)
+            fs_end = getattr(tokenize, "FSTRING_END", None)
+            in_fstring = 0
             for tok in tokens:
                 ttype, tstr, start, end, _ = tok
+                if fs_start is not None and ttype == fs_start:
+                    in_fstring += 1
+                    continue
+                if fs_end is not None and ttype == fs_end:
+                    in_fstring -= 1
+                    continue
+                if in_fstring:
+                    continue
                 if ttype == tokenize.OP:
-                    if tstr in "([{":
+                    if tstr in ("(", "[", "{"):
                         level += 1
-                    elif tstr in ")]}":
+                    elif tstr in (")", "]", "}"):
                         level = max(0, level - 1)
                     elif tstr == "," and level > 0:
-                        idx = self._pos_to_idx(line, end)
-                        breaks.append(idx)
+                        breaks.append(self._pos_to_idx(line, end))
             if not breaks:
                 out.append(line)
                 continue
             indent = re.match(r"\s*", line).group(0)
             hang = indent + " " * 4
-            remainder = line.strip()
+            prefix = indent
+            begin = len(indent)           # absolute index into `line`
             pieces: List[str] = []
-            current = remainder
-            while len((hang if pieces else indent) + current) > width:
-                limit = width - len((hang if pieces else indent))
-                base_offset = len(line) - len(remainder)
-                candidate_positions = [b for b in breaks if b - base_offset < limit]
-                if not candidate_positions:
+            while len(prefix) + (len(line) - begin) > width:
+                limit = width - len(prefix)
+                cands = [b for b in breaks if b > begin and b - begin <= limit]
+                if not cands:
                     break
-                cut_idx_src = max(candidate_positions)
-                rel_cut = cut_idx_src - base_offset
-                first = current[:rel_cut].rstrip()
-                rest = current[rel_cut:].lstrip()
-                pieces.append(((indent if not pieces else hang) + first).rstrip())
-                current = rest
-            if current:
-                pieces.append(((indent if not pieces else hang) + current).rstrip())
+                cut = max(cands)
+                pieces.append((prefix + line[begin:cut]).rstrip())
+                begin = cut
+                while begin < len(line) and line[begin] == " ":
+                    begin += 1
+                prefix = hang
+            if not pieces:
+                out.append(line)
+                continue
+            pieces.append(prefix + line[begin:])
             out.extend(pieces)
         return "\n".join(out)
 
-    # --------------- Refactor: Remove Unused Imports ---------------
+    # --------------- Refactor helpers (AST-driven) ---------------
+    @staticmethod
+    def _char_col(line: str, byte_col: int) -> int:
+        """AST columns are UTF-8 byte offsets; convert to str index."""
+        return len(line.encode("utf-8")[:byte_col].decode("utf-8", "ignore"))
+
+    def _unused_import_edits(self, code: str, is_init: bool = False):
+        """Return (new_code, removed_names) or (None, [])."""
+        try:
+            tree = ast.parse(code)
+        except SyntaxError:
+            return None, []
+        if is_init:
+            return None, []
+
+        used: Set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Name):
+                used.add(node.id)
+        # names re-exported through __all__
+        for node in tree.body:
+            if isinstance(node, (ast.Assign, ast.AugAssign, ast.AnnAssign)):
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                if any(isinstance(t, ast.Name) and t.id == "__all__" for t in targets):
+                    for c in ast.walk(node):
+                        if isinstance(c, ast.Constant) and isinstance(c.value, str):
+                            used.add(c.value)
+        # string annotations such as "List[Foo]"
+        ann_nodes: List[ast.AST] = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.arg) and node.annotation:
+                ann_nodes.append(node.annotation)
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.returns:
+                ann_nodes.append(node.returns)
+            elif isinstance(node, ast.AnnAssign):
+                ann_nodes.append(node.annotation)
+        for a in ann_nodes:
+            for c in ast.walk(a):
+                if isinstance(c, ast.Constant) and isinstance(c.value, str):
+                    used.update(re.findall(r"[A-Za-z_]\w*", c.value))
+
+        lines = code.split("\n")
+        start_count: Dict[int, int] = {}
+        for n in tree.body:
+            start_count[n.lineno] = start_count.get(n.lineno, 0) + 1
+
+        edits: List[Tuple[int, int, Optional[str]]] = []
+        removed: List[str] = []
+        for node in tree.body:
+            if not isinstance(node, (ast.Import, ast.ImportFrom)):
+                continue
+            if isinstance(node, ast.ImportFrom) and node.module == "__future__":
+                continue
+            if start_count.get(node.lineno, 0) > 1:
+                continue
+            span = lines[node.lineno - 1: node.end_lineno]
+            if any("noqa" in ln for ln in span):
+                continue
+            if any(a.name == "*" for a in node.names):
+                continue
+            keep, drop = [], []
+            for a in node.names:
+                if isinstance(node, ast.Import):
+                    bound = a.asname or a.name.split(".")[0]
+                else:
+                    bound = a.asname or a.name
+                (keep if bound in used else drop).append(a)
+            if not drop:
+                continue
+            removed.extend(a.asname or a.name for a in drop)
+            if not keep:
+                edits.append((node.lineno, node.end_lineno, None))
+                continue
+            parts = [a.name + (f" as {a.asname}" if a.asname else "") for a in keep]
+            if isinstance(node, ast.Import):
+                text = "import " + ", ".join(parts)
+            else:
+                text = f"from {'.' * node.level}{node.module or ''} import " + ", ".join(parts)
+            if node.lineno == node.end_lineno and "#" in span[0]:
+                text += "  #" + span[0].split("#", 1)[1]
+            edits.append((node.lineno, node.end_lineno, text))
+
+        if not edits:
+            return None, []
+        for a, b, text in sorted(edits, key=lambda e: e[0], reverse=True):
+            lines[a - 1: b] = [] if text is None else [text]
+        new = "\n".join(lines)
+        try:
+            ast.parse(new)
+        except SyntaxError:
+            return None, []
+        return new, removed
+
     def remove_unused_imports(self):
         code = self._get_buffer()
         ok, err = self._ast_valid(code)
         if not ok:
             messagebox.showwarning("Syntax error", f"Parsing failed; cannot refactor.\n\n{err}")
             return
-        try:
-            tree = ast.parse(code)
-        except SyntaxError as e:
-            messagebox.showwarning("Syntax error", f"Parsing failed; cannot refactor.\n\n{e}")
-            return
-
-        used: Set[str] = set()
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
-                used.add(node.id)
-            elif isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
-                used.add(node.value.id)
-
-        lines = code.splitlines()
-        new_lines: List[str] = []
-        modified = False
-
-        for i, line in enumerate(lines, start=1):
-            stripped = line.strip()
-            if not (stripped.startswith("import ") or stripped.startswith("from ")):
-                new_lines.append(line)
-                continue
-
-            # Check if line is part of a multi-line import
-            if i > 1 and (
-                lines[i - 2].strip().endswith(",")
-                or lines[i - 2].strip().endswith("\\")
-                or (
-                    lines[i - 2].strip().startswith("from ")
-                    and lines[i - 2].strip().endswith("(")
-                )
-            ):
-                new_lines.append(line)
-                continue
-            if i < len(lines) and (
-                stripped.endswith(",")
-                or stripped.endswith("\\")
-                or (stripped.startswith("from ") and stripped.endswith("("))
-            ):
-                new_lines.append(line)
-                continue
-
-            code_part, comment = (line.split("#", 1) + [""])[:2]
-            comment_str = ("  #" + comment) if comment else ""
-
-            if stripped.startswith("import "):
-                try:
-                    names = [p.strip() for p in code_part[len("import ") :].split(",")]
-                    kept = []
-                    for n in names:
-                        alias = n.split(" as ")[-1].strip()
-                        root = alias.split(".")[0]
-                        if root in used or n.startswith("__future__"):
-                            kept.append(n)
-                    if kept:
-                        new_lines.append(
-                            f"{line.split('import ')[0]}import " + ", ".join(kept) + comment_str
-                        )
-                        if len(kept) < len(names):
-                            modified = True
-                    else:
-                        modified = True
-                except Exception:
-                    new_lines.append(line)
-
-            elif stripped.startswith("from "):
-                m = re.match(r"(\s*from\s+[\.\w]+)\s+import\s+(.*)$", code_part)
-                if m:
-                    header, namestr = m.group(1), m.group(2)
-                    if namestr.strip().startswith("("):
-                        new_lines.append(line)
-                        continue
-                    parts = [p.strip() for p in namestr.split(",")]
-                    kept = []
-                    for p in parts:
-                        alias = re.split(r"\s+as\s+", p)[-1]
-                        name = re.split(r"\s+as\s+", p)[0]
-                        symbol = alias if alias != p else name
-                        if name == "*" or symbol in used or header.strip().endswith("__future__"):
-                            kept.append(p)
-                    if kept:
-                        new_lines.append(
-                            f"{header} import " + ", ".join(kept) + comment_str
-                        )
-                        if len(kept) < len(parts):
-                            modified = True
-                    else:
-                        modified = True
-                else:
-                    new_lines.append(line)
-            else:
-                new_lines.append(line)
-
-        out = "\n".join(new_lines)
-        if modified:
-            self.display_code(out)
-            self.set_status("Removed unused imports (conservative)")
-            self.indentation_applied = True
-            self.update_save_state()
-        else:
+        is_init = bool(self.filename) and os.path.basename(self.filename) == "__init__.py"
+        new, removed = self._unused_import_edits(code, is_init)
+        if new is None:
             self.set_status("No unused imports found (conservative)")
+            return
+        self.display_code(new)
+        self.set_status(f"Removed {len(removed)} unused import name(s): {', '.join(removed[:5])}")
+        self.indentation_applied = True
+        self.update_save_state()
 
     # --------------- Refactor: Simplify Boolean Returns ---------------
+    def _simplify_boolean_returns_text(self, code: str):
+        """Return (new_code, count) or (None, 0)."""
+        try:
+            tree = ast.parse(code)
+        except SyntaxError:
+            return None, 0
+        lines = code.split("\n")
+        repl: List[Tuple[int, int, str]] = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.If):
+                continue
+            if len(node.body) != 1 or len(node.orelse) != 1:
+                continue
+            rt, rf = node.body[0], node.orelse[0]
+            if not (isinstance(rt, ast.Return) and isinstance(rf, ast.Return)):
+                continue
+            vt, vf = rt.value, rf.value
+            if not (isinstance(vt, ast.Constant) and isinstance(vf, ast.Constant)):
+                continue
+            if not (isinstance(vt.value, bool) and isinstance(vf.value, bool)):
+                continue
+            if vt.value == vf.value:
+                continue
+            first = lines[node.lineno - 1]
+            if not first.lstrip().startswith("if "):      # skips `elif` branches
+                continue
+            span = lines[node.lineno - 1: node.end_lineno]
+            if any("#" in ln for ln in span):             # would drop comments
+                continue
+            test = ast.get_source_segment(code, node.test)
+            if not test:
+                continue
+            indent = first[: len(first) - len(first.lstrip())]
+            if vt.value:
+                text = f"{indent}return bool({test})"
+            else:
+                simple = isinstance(
+                    node.test,
+                    (ast.Name, ast.Call, ast.Attribute, ast.Subscript, ast.Constant),
+                )
+                text = f"{indent}return not {test}" if simple else f"{indent}return not ({test})"
+            repl.append((node.lineno, node.end_lineno, text))
+        if not repl:
+            return None, 0
+        for a, b, text in sorted(repl, key=lambda r: r[0], reverse=True):
+            lines[a - 1: b] = [text]
+        new = "\n".join(lines)
+        try:
+            ast.parse(new)
+        except SyntaxError:
+            return None, 0
+        return new, len(repl)
+
     def simplify_boolean_returns(self):
         code = self._get_buffer()
         ok, err = self._ast_valid(code)
         if not ok:
             messagebox.showwarning("Syntax error", f"Parsing failed; cannot refactor.\n\n{err}")
             return
-
-        try:
-            tree = ast.parse(code)
-        except SyntaxError as e:
-            messagebox.showwarning("Syntax error", f"Parsing failed; cannot refactor.\n\n{e}")
-            return
-
-        replacements: List[Tuple[Tuple[int, int], str]] = []
-        for node in ast.walk(tree):
-            if isinstance(node, ast.If):
-                body = node.body
-                orelse = node.orelse
-                if (
-                    len(body) == 1
-                    and len(orelse) == 1
-                    and isinstance(body[0], ast.Return)
-                    and isinstance(orelse[0], ast.Return)
-                ):
-                    rt = getattr(body[0], "value", None)
-                    rf = getattr(orelse[0], "value", None)
-                    if isinstance(rt, ast.Constant) and isinstance(rf, ast.Constant):
-                        rt_val = rt.value
-                        rf_val = rf.value
-                    else:
-                        continue
-                    if rt_val is True and rf_val is False:
-                        seg = ast.get_source_segment(code, node)
-                        test_seg = ast.get_source_segment(code, node.test)
-                        if seg and test_seg:
-                            indent = re.match(r"\s*", seg).group(0)
-                            repl = f"{indent}return bool({test_seg})"
-                            replacements.append(
-                                ((node.lineno, node.end_lineno or node.lineno), repl)
-                            )
-                    elif rt_val is False and rf_val is True:
-                        seg = ast.get_source_segment(code, node)
-                        test_seg = ast.get_source_segment(code, node.test)
-                        if seg and test_seg:
-                            indent = re.match(r"\s*", seg).group(0)
-                            repl = f"{indent}return not bool({test_seg})"
-                            replacements.append(
-                                ((node.lineno, node.end_lineno or node.lineno), repl)
-                            )
-
-        if not replacements:
+        new, n = self._simplify_boolean_returns_text(code)
+        if new is None:
             self.set_status("No boolean return patterns found")
             return
-
-        lines = code.splitlines()
-        modified = False
-        for (start, end), text in sorted(replacements, key=lambda x: x[0][0], reverse=True):
-            if start <= end:
-                lines[start - 1 : end] = [text]
-                modified = True
-
-        if modified:
-            out = "\n".join(lines)
-            self.display_code(out)
-            self.set_status("Simplified boolean returns (conservative)")
-            self.indentation_applied = True
-            self.update_save_state()
-        else:
-            self.set_status("No boolean return patterns found")
+        self.display_code(new)
+        self.set_status(f"Simplified {n} boolean return(s) (conservative)")
+        self.indentation_applied = True
+        self.update_save_state()
 
     # --------------- Refactor: Convert to f-strings (safe) ---------------
+    def _convert_fstrings_text(self, code: str):
+        """Return (new_code, count) or (None, 0). Only converts when every
+        argument is a plain name and the template uses nothing exotic."""
+        try:
+            tree = ast.parse(code)
+        except SyntaxError:
+            return None, 0
+        lines = code.split("\n")
+        formatter = string.Formatter()
+        edits: List[Tuple[int, int, int, str]] = []   # lineno, col, end_col, text
+
+        def literal_body(const: ast.Constant) -> Optional[Tuple[str, str]]:
+            if const.lineno != const.end_lineno:
+                return None
+            ln = lines[const.lineno - 1]
+            a = self._char_col(ln, const.col_offset)
+            b = self._char_col(ln, const.end_col_offset)
+            seg = ln[a:b]
+            if len(seg) < 2 or seg[0] not in "\"'" or seg[-1] != seg[0]:
+                return None
+            q, body = seg[0], seg[1:-1]
+            if q in body or "\\N{" in body or body.startswith(q * 2):
+                return None
+            return q, body
+
+        def is_name(n: ast.AST) -> bool:
+            return isinstance(n, ast.Name)
+
+        for node in ast.walk(tree):
+            if node.lineno != getattr(node, "end_lineno", -1) if hasattr(node, "lineno") else True:
+                continue
+            new_text = None
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "format"
+                and isinstance(node.func.value, ast.Constant)
+                and isinstance(node.func.value.value, str)
+                and all(is_name(a) for a in node.args)
+                and all(k.arg is not None and is_name(k.value) for k in node.keywords)
+            ):
+                lit = literal_body(node.func.value)
+                if not lit:
+                    continue
+                q, body = lit
+                pos = [a.id for a in node.args]
+                kws = {k.arg: k.value.id for k in node.keywords}
+                out, auto, manual, okay = [], 0, False, True
+                try:
+                    parsed = list(formatter.parse(body))
+                except ValueError:
+                    continue
+                for literal, fname, spec, conv in parsed:
+                    out.append(literal.replace("{", "{{").replace("}", "}}"))
+                    if fname is None:
+                        continue
+                    if "{" in (spec or "") or "}" in (spec or "") or re.search(r"[.\[]", fname):
+                        okay = False
+                        break
+                    if fname == "":
+                        if manual or auto >= len(pos):
+                            okay = False
+                            break
+                        expr, auto = pos[auto], auto + 1
+                    elif fname.isdigit():
+                        if auto or int(fname) >= len(pos):
+                            okay = False
+                            break
+                        manual, expr = True, pos[int(fname)]
+                    elif fname in kws:
+                        expr = kws[fname]
+                    else:
+                        okay = False
+                        break
+                    out.append("{" + expr + (f"!{conv}" if conv else "") + (f":{spec}" if spec else "") + "}")
+                if okay:
+                    new_text = "f" + q + "".join(out) + q
+            elif (
+                isinstance(node, ast.BinOp)
+                and isinstance(node.op, ast.Mod)
+                and isinstance(node.left, ast.Constant)
+                and isinstance(node.left.value, str)
+                and (is_name(node.right) or (
+                    isinstance(node.right, ast.Tuple) and node.right.elts
+                    and all(is_name(e) for e in node.right.elts)))
+            ):
+                lit = literal_body(node.left)
+                if not lit:
+                    continue
+                q, body = lit
+                names = [node.right.id] if is_name(node.right) else [e.id for e in node.right.elts]
+                out, idx, okay = [], 0, True
+                pos_ = 0
+                for m in re.finditer(r"%(.?)", body):
+                    out.append(body[pos_:m.start()].replace("{", "{{").replace("}", "}}"))
+                    pos_ = m.end()
+                    kind = m.group(1)
+                    if kind == "%":
+                        out.append("%")
+                    elif kind in ("s", "r") and idx < len(names):
+                        out.append("{" + names[idx] + ("!r" if kind == "r" else "") + "}")
+                        idx += 1
+                    else:
+                        okay = False
+                        break
+                if okay and idx == len(names):
+                    out.append(body[pos_:].replace("{", "{{").replace("}", "}}"))
+                    new_text = "f" + q + "".join(out) + q
+            if new_text:
+                ln = lines[node.lineno - 1]
+                edits.append((
+                    node.lineno,
+                    self._char_col(ln, node.col_offset),
+                    self._char_col(ln, node.end_col_offset),
+                    new_text,
+                ))
+        if not edits:
+            return None, 0
+        for lineno, a, b, text in sorted(edits, key=lambda e: (e[0], e[1]), reverse=True):
+            ln = lines[lineno - 1]
+            lines[lineno - 1] = ln[:a] + text + ln[b:]
+        new = "\n".join(lines)
+        try:
+            ast.parse(new)
+        except SyntaxError:
+            return None, 0
+        return new, len(edits)
+
     def convert_to_fstrings(self):
         code = self._get_buffer()
         ok, err = self._ast_valid(code)
         if not ok:
             messagebox.showwarning("Syntax error", f"Parsing failed; cannot refactor.\n\n{err}")
             return
-
-        out_lines: List[str] = []
-        modified = False
-
-        for line in code.splitlines():
-            new_line = line
-
-            # .format case
-            m = re.search(
-                r"([rubf]*['\"])((?:[^\\]|\\.)*?)\1\.format\(([^)]*)\)",
-                line,
-                re.IGNORECASE,
-            )
-            if m and "f" not in m.group(1).lower():
-                quote = m.group(1)
-                template = m.group(2)
-                args_str = m.group(3)
-
-                if re.search(r"[\(\)\[\]\{\}]", args_str):
-                    out_lines.append(line)
-                    continue
-
-                args = [a.strip() for a in args_str.split(",") if a.strip()]
-                kwargs: Dict[str, str] = {}
-                pos_args: List[str] = []
-                try:
-                    for arg in args:
-                        if "=" in arg:
-                            k, v = arg.split("=", 1)
-                            kwargs[k.strip()] = v.strip()
-                        else:
-                            pos_args.append(arg)
-                except Exception:
-                    out_lines.append(line)
-                    continue
-
-                if all(
-                    re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", v)
-                    for v in kwargs.values()
-                ) and all(
-                    re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", v)
-                    for v in pos_args
-                ):
-                    try:
-                        def repl_field(mf: re.Match) -> str:
-                            key = mf.group(1).strip()
-                            fmt = mf.group(2) or ""
-                            if key.isdigit():
-                                idx = int(key)
-                                if 0 <= idx < len(pos_args):
-                                    return "{" + pos_args[idx] + fmt + "}"
-                            elif key in kwargs:
-                                return "{" + kwargs[key] + fmt + "}"
-                            elif key in pos_args:
-                                return "{" + key + fmt + "}"
-                            raise ValueError("Cannot map field")
-
-                        templ = re.sub(
-                            r"\{\s*([^\}:!]+)\s*([:!][^\}]*)?\}",
-                            repl_field,
-                            template,
-                        )
-                        templ = templ.replace("{", "{{").replace("}", "}}")
-
-                        new_line = (
-                            line[: m.start()]
-                            + f"f{quote}"
-                            + templ
-                            + f"{quote}"
-                            + line[m.end() :]
-                        )
-                        modified = True
-                    except Exception:
-                        new_line = line
-
-            # % formatting
-            mp = re.search(
-                r"([rubf]*['\"])((?:[^\\]|\\.)*?)\1\s*%\s*(\(([^\)]*)\)|[A-Za-z_][A-Za-z0-9_]*)",
-                new_line,
-            )
-            if mp and "f" not in mp.group(1).lower():
-                quote = mp.group(1)
-                template = mp.group(2)
-                rhs = mp.group(3)
-                names: List[str] = []
-
-                if rhs.startswith("("):
-                    parts = [p.strip() for p in mp.group(4).split(",") if p.strip()]
-                    if all(re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", p) for p in parts):
-                        names = parts
-                else:
-                    if re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", rhs):
-                        names = [rhs]
-
-                if names:
-                    idx = 0
-
-                    def repl_pct(mt: re.Match) -> str:
-                        nonlocal idx
-                        spec = mt.group(0)
-                        if idx < len(names):
-                            fmt = ""
-                            if spec.endswith("r"):
-                                fmt = "!r"
-                            s = "{" + names[idx] + fmt + "}"
-                            idx += 1
-                            return s
-                        return spec
-
-                    templ = re.sub(r"%%", "@@PERCENT@@", template)
-                    templ = re.sub(r"%(?:\.\d+)?[srdfige]", repl_pct, templ)
-                    templ = templ.replace("@@PERCENT@@", "%")
-                    templ = templ.replace("{", "{{").replace("}", "}}")
-
-                    new_line = (
-                        new_line[: mp.start()]
-                        + f"f{quote}"
-                        + templ
-                        + f"{quote}"
-                        + new_line[mp.end() :]
-                    )
-                    modified = True
-
-            out_lines.append(new_line)
-
-        if modified:
-            out = "\n".join(out_lines)
-            self.display_code(out)
-            self.set_status("Converted some strings to f-strings (safe subset)")
-            self.indentation_applied = True
-            self.update_save_state()
-        else:
+        new, n = self._convert_fstrings_text(code)
+        if new is None:
             self.set_status("No safe f-string conversions found")
+            return
+        self.display_code(new)
+        self.set_status(f"Converted {n} string(s) to f-strings (safe subset)")
+        self.indentation_applied = True
+        self.update_save_state()
 
     # --------------- External formatters ---------------
     def run_external_formatter(self):
